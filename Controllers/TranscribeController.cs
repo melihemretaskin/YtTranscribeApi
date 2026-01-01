@@ -21,7 +21,7 @@ public class TranscribeController : ControllerBase
     public record TranscribeReq(string url, string? preferLanguage, bool forceOpenAi = false);
     public record TranscribeRes(bool ok, string source, string transcript, string? note = null);
 
-    // ============= 1) URL -> caption or openai =============
+    // URL -> caption veya (mümkünse) openai
     [HttpPost("transcribe")]
     public async Task<IActionResult> Transcribe([FromBody] TranscribeReq req, CancellationToken ct)
     {
@@ -32,12 +32,11 @@ public class TranscribeController : ControllerBase
 
         var yt = new YoutubeClient();
 
-        // Caption dene
         if (!req.forceOpenAi)
         {
             try
             {
-                _log.LogInformation("Trying captions... preferLanguage={Lang}", req.preferLanguage);
+                _log.LogInformation("Trying captions... lang={Lang}", req.preferLanguage);
                 var captionText = await TryGetCaptionAsync(yt, req.url, req.preferLanguage, ct);
 
                 if (!string.IsNullOrWhiteSpace(captionText))
@@ -50,18 +49,17 @@ public class TranscribeController : ControllerBase
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Caption flow failed -> fallback to OpenAI");
+                _log.LogWarning(ex, "Caption failed -> fallback to OpenAI");
             }
         }
 
-        // OpenAI fallback (YouTube audio indirerek)
         var apiKey = GetApiKey();
         if (string.IsNullOrWhiteSpace(apiKey))
             return StatusCode(500, new { ok = false, error = "OPENAI_API_KEY env missing" });
 
         try
         {
-            _log.LogInformation("Downloading audio then OpenAI transcribe...");
+            _log.LogInformation("Downloading audio then OpenAI...");
             var transcript = await TranscribeFromYoutubeWithOpenAiAsync(yt, req.url, apiKey!, req.preferLanguage, ct);
 
             _log.LogInformation("DONE openai len={Len}", transcript.Length);
@@ -69,14 +67,13 @@ public class TranscribeController : ControllerBase
         }
         catch (Exception ex)
         {
-            // Burada canlıda gördüğün "Video is not available" patlıyor.
             _log.LogError(ex, "FAIL /api/transcribe");
             return StatusCode(500, new
             {
                 ok = false,
                 error = "Transcription failed",
                 details = ex.Message,
-                hint = "Bu video sunucu IP/region/age/cookie nedeniyle indirilemiyor olabilir. En sağlam çözüm: /api/transcribe/upload ile dosya gönder."
+                hint = "YouTube video server IP/region/age/cookie nedeniyle indirilemiyor olabilir. En sağlam çözüm: /api/transcribe/upload"
             });
         }
         finally
@@ -85,9 +82,11 @@ public class TranscribeController : ControllerBase
         }
     }
 
-    // ============= 2) UPLOAD -> direct openai (EN SAĞLAM) =============
+    // UPLOAD -> en sağlam (Swagger'dan gizli, swagger patlamasın)
+    [ApiExplorerSettings(IgnoreApi = true)]
     [HttpPost("transcribe/upload")]
-    [RequestSizeLimit(1024L * 1024L * 1024L)] // 1GB
+    [Consumes("multipart/form-data")]
+    [RequestSizeLimit(1024L * 1024L * 1024L)]
     public async Task<IActionResult> TranscribeUpload([FromForm] IFormFile file, [FromForm] string? preferLanguage, CancellationToken ct)
     {
         _log.LogInformation("START /api/transcribe/upload file={Name} size={Size} lang={Lang}",
@@ -102,18 +101,18 @@ public class TranscribeController : ControllerBase
 
         var lang = NormalizeLang(preferLanguage);
 
-        // temp kaydet
         var ext = Path.GetExtension(file.FileName);
         if (string.IsNullOrWhiteSpace(ext)) ext = ".bin";
         var tempPath = Path.Combine(Path.GetTempPath(), $"upload-{Guid.NewGuid():N}{ext}");
 
         try
         {
-            _log.LogInformation("Saving upload to tempPath={Path}", tempPath);
+            _log.LogInformation("Saving upload to {Path}", tempPath);
             await using (var fs = System.IO.File.Create(tempPath))
                 await file.CopyToAsync(fs, ct);
 
-            var bytes = new FileInfo(tempPath).Length;
+            long bytes = 0;
+            try { bytes = new FileInfo(tempPath).Length; } catch { }
             _log.LogInformation("Saved bytes={Bytes}. Calling OpenAI...", bytes);
 
             var transcript = await TranscribeLocalFileWithOpenAiAsync(apiKey!, tempPath, file.FileName, lang, ct);
@@ -133,8 +132,7 @@ public class TranscribeController : ControllerBase
         }
     }
 
-    // ===================== Helpers =====================
-
+    // ---------- helpers ----------
     private string? GetApiKey()
         => _cfg["OPENAI_API_KEY"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
@@ -151,7 +149,7 @@ public class TranscribeController : ControllerBase
             "english" => "en",
             "ingilizce" => "en",
             "en" => "en",
-            _ => lang.Length == 2 ? lang : null // 2 harf değilse hiç yollama
+            _ => lang.Length == 2 ? lang : null
         };
     }
 
@@ -185,9 +183,7 @@ public class TranscribeController : ControllerBase
         ClosedCaptionTrack track = await yt.Videos.ClosedCaptions.GetAsync(trackInfo, ct);
 
         var text = string.Join(" ",
-            track.Captions
-                 .Select(c => c.Text)
-                 .Where(x => !string.IsNullOrWhiteSpace(x))
+            track.Captions.Select(c => c.Text).Where(x => !string.IsNullOrWhiteSpace(x))
         );
 
         return string.IsNullOrWhiteSpace(text) ? null : text;
@@ -218,20 +214,16 @@ public class TranscribeController : ControllerBase
 
         var tempPath = Path.Combine(Path.GetTempPath(), $"yt-audio-{Guid.NewGuid():N}.{audioStreamInfo.Container.Name}");
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
         _log.LogInformation("Downloading audio to {Path}", tempPath);
 
         await using (var fs = System.IO.File.OpenWrite(tempPath))
         {
-            // ÖNEMLİ: progress null veriyoruz
             await yt.Videos.Streams.CopyToAsync(audioStreamInfo, fs, progress: null, cancellationToken: ct);
         }
 
-        sw.Stop();
         long bytes = 0;
         try { bytes = new FileInfo(tempPath).Length; } catch { }
-
-        _log.LogInformation("Downloaded in {Ms}ms bytes={Bytes}", sw.ElapsedMilliseconds, bytes);
+        _log.LogInformation("Downloaded bytes={Bytes}", bytes);
 
         try
         {
@@ -254,17 +246,12 @@ public class TranscribeController : ControllerBase
 
         await using var fileStream = System.IO.File.OpenRead(filePath);
 
-        var options = new AudioTranscriptionOptions
-        {
-            Language = lang
-        };
+        var options = new AudioTranscriptionOptions { Language = lang };
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
         var res = await audio.TranscribeAudioAsync(fileStream, fileName, options, ct);
-        sw.Stop();
 
         var text = res.Value.Text?.Trim();
-        _log.LogInformation("OpenAI done in {Ms}ms textLen={Len}", sw.ElapsedMilliseconds, text?.Length ?? 0);
+        _log.LogInformation("OpenAI textLen={Len}", text?.Length ?? 0);
 
         if (string.IsNullOrWhiteSpace(text))
             throw new InvalidOperationException("OpenAI returned empty transcript.");
