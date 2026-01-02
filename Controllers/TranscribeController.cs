@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using OpenAI.Audio;
 using YoutubeExplode;
 using YoutubeExplode.Videos.ClosedCaptions;
 using System.Net;
@@ -20,9 +21,9 @@ public class TranscribeController : ControllerBase
     }
 
     public record TranscribeReq(string url, string? preferLanguage);
-    public record TranscribeRes(bool ok, string source, string transcript);
+    public record TranscribeRes(bool ok, string source, string transcript, string? note = null);
 
-    // ✅ CAPTION-ONLY: video indirme yok, openai yok
+    // ✅ CAPTION-ONLY (cookie ile dener). İndirme yok.
     [HttpPost("transcribe")]
     public async Task<IActionResult> Transcribe([FromBody] TranscribeReq req, CancellationToken ct)
     {
@@ -52,7 +53,7 @@ public class TranscribeController : ControllerBase
                 ok = false,
                 error = "caption_unavailable",
                 details = "Bu videonun herkese açık transcript (caption) verisi yok veya sunucudan erişilemiyor.",
-                hint = "Cookie ile de alınamadıysa region/IP blok olabilir. En sağlam çözüm upload."
+                hint = "Audio/video dosyasını /api/transcribe/upload ile gönder."
             });
         }
         catch (Exception ex)
@@ -72,21 +73,93 @@ public class TranscribeController : ControllerBase
         }
     }
 
-    // (opsiyonel placeholder)
+    // ✅ UPLOAD -> OpenAI Whisper (garanti çözüm)
+    // Swagger’da görünmesini istiyorsan IgnoreApi kaldırabilirsin ama gerek yok.
     [ApiExplorerSettings(IgnoreApi = true)]
     [HttpPost("transcribe/upload")]
     [Consumes("multipart/form-data")]
-    public IActionResult UploadPlaceholder()
-        => StatusCode(501, new { ok = false, error = "not_implemented", details = "Upload transcribe bu build’de kapalı." });
+    [RequestSizeLimit(1024L * 1024L * 1024L)]
+    public async Task<IActionResult> TranscribeUpload([FromForm] IFormFile file, [FromForm] string? preferLanguage, CancellationToken ct)
+    {
+        _log.LogInformation("START /api/transcribe/upload file={Name} size={Size} lang={Lang}",
+            file?.FileName, file?.Length, preferLanguage);
 
-    // -------- COOKIE'li YoutubeClient --------
+        if (file == null || file.Length == 0)
+            return BadRequest(new { ok = false, error = "file required" });
 
+        var apiKey = GetApiKey();
+        if (string.IsNullOrWhiteSpace(apiKey))
+            return StatusCode(500, new { ok = false, error = "OPENAI_API_KEY env missing" });
+
+        var lang = NormalizeLang(preferLanguage);
+
+        var ext = Path.GetExtension(file.FileName);
+        if (string.IsNullOrWhiteSpace(ext)) ext = ".bin";
+        var tempPath = Path.Combine(Path.GetTempPath(), $"upload-{Guid.NewGuid():N}{ext}");
+
+        try
+        {
+            _log.LogInformation("Saving upload to {Path}", tempPath);
+            await using (var fs = System.IO.File.Create(tempPath))
+                await file.CopyToAsync(fs, ct);
+
+            long bytes = 0;
+            try { bytes = new FileInfo(tempPath).Length; } catch { }
+            _log.LogInformation("Saved bytes={Bytes}. Calling OpenAI whisper-1...", bytes);
+
+            var transcript = await TranscribeLocalFileWithOpenAiAsync(apiKey!, tempPath, file.FileName, lang, ct);
+
+            _log.LogInformation("DONE upload openai len={Len}", transcript.Length);
+            return Ok(new TranscribeRes(true, "openai", transcript, "Upload ile OpenAI Whisper kullanıldı."));
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "FAIL /api/transcribe/upload");
+            return StatusCode(500, new { ok = false, error = "transcription_failed", details = ex.Message });
+        }
+        finally
+        {
+            try { System.IO.File.Delete(tempPath); } catch { }
+            _log.LogInformation("END /api/transcribe/upload");
+        }
+    }
+
+    // ---------- OpenAI ----------
+    private string? GetApiKey()
+        => _cfg["OPENAI_API_KEY"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+
+    private async Task<string> TranscribeLocalFileWithOpenAiAsync(
+        string apiKey,
+        string filePath,
+        string fileName,
+        string? lang,
+        CancellationToken ct)
+    {
+        var audio = new AudioClient("whisper-1", apiKey);
+
+        await using var fs = System.IO.File.OpenRead(filePath);
+
+        var options = new AudioTranscriptionOptions
+        {
+            Language = lang
+        };
+
+        var res = await audio.TranscribeAudioAsync(fs, fileName, options, ct);
+
+        var text = res.Value.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            throw new InvalidOperationException("OpenAI returned empty transcript.");
+
+        return text!;
+    }
+
+    // ---------- Cookie'li YoutubeClient ----------
     private YoutubeClient CreateYoutubeClientWithCookies()
     {
         var b64 = _cfg["YT_COOKIES_B64"] ?? Environment.GetEnvironmentVariable("YT_COOKIES_B64");
         if (string.IsNullOrWhiteSpace(b64))
         {
-            _log.LogInformation("YT_COOKIES_B64 not set -> using default YoutubeClient()");
+            _log.LogInformation("YT_COOKIES_B64 not set -> default YoutubeClient()");
             return new YoutubeClient();
         }
 
@@ -108,20 +181,18 @@ public class TranscribeController : ControllerBase
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             );
 
-            _log.LogInformation("YT_COOKIES_B64 loaded -> using cookie-enabled YoutubeClient()");
+            _log.LogInformation("YT_COOKIES_B64 loaded -> cookie-enabled YoutubeClient()");
             return new YoutubeClient(http);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Failed to load cookies -> using default YoutubeClient()");
+            _log.LogWarning(ex, "Failed to load cookies -> default YoutubeClient()");
             return new YoutubeClient();
         }
     }
 
     private static void LoadNetscapeCookiesInto(CookieContainer jar, string cookiesTxt)
     {
-        // Netscape cookies.txt format:
-        // domain \t flag \t path \t secure \t expiration \t name \t value
         using var sr = new StringReader(cookiesTxt);
         string? line;
 
@@ -139,13 +210,13 @@ public class TranscribeController : ControllerBase
             var name = parts[5];
             var value = parts[6];
 
-            // bazı exporter'lar HttpOnly cookie'leri "#HttpOnly_" ile yazar
             if (domain.StartsWith("#HttpOnly_", StringComparison.OrdinalIgnoreCase))
                 domain = domain.Substring("#HttpOnly_".Length);
 
             if (!domain.StartsWith(".")) domain = "." + domain;
+            if (string.IsNullOrWhiteSpace(path)) path = "/";
 
-            var cookie = new Cookie(name, value, string.IsNullOrWhiteSpace(path) ? "/" : path, domain)
+            var cookie = new Cookie(name, value, path, domain)
             {
                 Secure = secure,
                 HttpOnly = false
@@ -155,8 +226,7 @@ public class TranscribeController : ControllerBase
         }
     }
 
-    // -------- helpers --------
-
+    // ---------- Helpers ----------
     private static string? NormalizeLang(string? lang)
     {
         if (string.IsNullOrWhiteSpace(lang)) return null;
